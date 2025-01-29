@@ -107,14 +107,13 @@ class TemperatureDataProcessor:
 
         return processed_data
 
-    def clean_temp_data(self, df, temp_range=(-50, 130), acceptable_deviation=10):
+    def clean_temp_data(self, df, temp_range=(-50, 130)):
         """
         Cleans temperature data by removing extreme values and flagging anomalies.
 
         Parameters:
         - df (DataFrame): Temperature dataset.
         - temp_range (tuple): Valid temperature range.
-        - acceptable_deviation (float): Threshold for deviations.
 
         Returns:
         - Cleaned DataFrame with QC flags.
