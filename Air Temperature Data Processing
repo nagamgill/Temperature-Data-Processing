@@ -8,7 +8,8 @@ import sqlite3
 
 class TemperatureDataProcessor:
     """
-    A class for fetching, processing, cleaning, and exporting temperature data from USDA NRCS AWDB API.
+    A class for fetching, processing, cleaning, and exporting temperature data 
+    from USDA NRCS AWDB API.
     """
 
     def __init__(self, station_triplets, start_date, end_date, db_name="temperature_data.db"):
@@ -84,14 +85,34 @@ class TemperatureDataProcessor:
         except Exception:
             return pd.DataFrame()
 
-    def clean_temp_data(self, df, nearby_sites, por_medians, temp_range=(-50, 130), acceptable_deviation=10):
+    def parallel_fetch(self):
+        """
+        Fetches data for all temperature elements in parallel.
+
+        Returns:
+        - Dictionary containing processed data for each element.
+        """
+        fetch_tasks = []
+        for station in self.station_triplets:
+            for element, duration in zip(self.elements, self.durations):
+                fetch_tasks.append(dask.delayed(self.fetch_awdb_data)(station, element, duration))
+
+        with ProgressBar():
+            results = dask.compute(*fetch_tasks, num_workers=4)
+
+        processed_data = {}
+        for (element, result) in zip(self.elements, results):
+            label = element.split(":")[0]
+            processed_data[label] = self.preprocess_data(result, label)
+
+        return processed_data
+
+    def clean_temp_data(self, df, temp_range=(-50, 130), acceptable_deviation=10):
         """
         Cleans temperature data by removing extreme values and flagging anomalies.
 
         Parameters:
         - df (DataFrame): Temperature dataset.
-        - nearby_sites (dict): Data from nearby stations.
-        - por_medians (dict): Period-of-record medians for anomaly detection.
         - temp_range (tuple): Valid temperature range.
         - acceptable_deviation (float): Threshold for deviations.
 
@@ -111,18 +132,7 @@ class TemperatureDataProcessor:
             if col in df.columns:
                 outliers = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
                 df.loc[outliers, f"{col}_qc_flag"] = "E"
-                df.loc[outliers, col] = ""  # Replace with empty string
-
-        # Flag based on POR medians
-        for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
-            if col in df.columns:
-                for date in df.index:
-                    month_day = (date.month, date.day)
-                    if month_day in por_medians[col]:
-                        median_threshold = por_medians[col][month_day] + acceptable_deviation
-                        if df.loc[date, col] > median_threshold:
-                            df.loc[date, f"{col}_qc_flag"] = "E"
-                            df.loc[date, col] = ""  # Mark as edited
+                df.loc[outliers, col] = ""  # Replace with empty string instead of NaN
 
         return df
 
@@ -134,7 +144,7 @@ class TemperatureDataProcessor:
         - df (DataFrame): Cleaned temperature data.
         - filename (str): CSV filename.
         """
-        df.to_csv(filename, index=True, na_rep="")
+        df.to_csv(filename, index=True)
         print(f"Cleaned data saved to {filename}")
 
 # ---------------------- SCRIPT EXECUTION ----------------------
@@ -157,13 +167,8 @@ for key, df in temp_data.items():
         else:
             df_combined = df_combined.join(df, how="outer")
 
-# Fetch nearby sites & POR medians
-nearby_stations = temp_processor.find_nearby_sites(amount_of_sites=5, dist=50, networks=['SNTL'])
-nearby_data = {site: temp_processor.preprocess_data(temp_processor.fetch_awdb_data(site, "TMAX:*:1", "DAILY"), "TMAX") for site in nearby_stations}
-por_medians = temp_processor.get_CentralTendency(centralTendencyType="Median")
-
 # Clean data
-df_cleaned = temp_processor.clean_temp_data(df_combined, nearby_data, por_medians)
+df_cleaned = temp_processor.clean_temp_data(df_combined)
 
 # Export to CSV
 columns_to_export = [
@@ -172,5 +177,5 @@ columns_to_export = [
     "TAVG_original", "TAVG", "TAVG_qc_flag",
     "TOBS_original", "TOBS", "TOBS_qc_flag",
 ]
-df_cleaned[columns_to_export].to_csv("temperature_cleaned.csv", index=True, na_rep="")
+df_cleaned[columns_to_export].to_csv("temperature_cleaned.csv", index=True)
 print("Cleaned data saved to 'temperature_cleaned.csv'.")
