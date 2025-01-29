@@ -18,21 +18,26 @@ class TemperatureDataProcessor:
 
         Parameters:
         - station_triplets (list): List of station identifiers.
-        - start_date (str): Start date in YYYY-MM-DD format.
-        - end_date (str): End date in YYYY-MM-DD format.
+        - start_date (str): Start date in YYYY-MM-DD HH:mm format.
+        - end_date (str): End date in YYYY-MM-DD HH:mm format.
         - db_name (str): SQLite database name for data storage.
         """
         self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
         self.station_triplets = station_triplets
-        self.start_date = start_date
-        self.end_date = end_date
+        self.start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d %H:%M")  # Ensure correct format
+        self.end_date = pd.to_datetime(end_date).strftime("%Y-%m-%d %H:%M")  # Ensure correct format
         self.db_name = db_name
-        self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]  
+        self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]
         self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """
         Fetches temperature data from the AWDB API.
+
+        Parameters:
+        - station_triplet (str): Station identifier.
+        - element (str): Temperature element (e.g., TOBS, TMAX).
+        - duration (str): Duration type (e.g., DAILY, HOURLY).
 
         Returns:
         - JSON response containing data or None if failed.
@@ -55,6 +60,13 @@ class TemperatureDataProcessor:
     def preprocess_data(self, data_json, label):
         """
         Converts API JSON response to a pandas DataFrame.
+
+        Parameters:
+        - data_json (dict): JSON response from API.
+        - label (str): Column name for temperature element.
+
+        Returns:
+        - Pandas DataFrame containing processed data.
         """
         if not data_json or not isinstance(data_json, list):
             return pd.DataFrame()
@@ -65,7 +77,7 @@ class TemperatureDataProcessor:
                 return pd.DataFrame()
             
             df = pd.DataFrame(flat_data)
-            df['date'] = pd.to_datetime(df['date'], format="%Y-%m-%d %H:%M", errors='coerce')
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')  # Ensure correct datetime format
             df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
             df.rename(columns={'value': label}, inplace=True)
@@ -76,6 +88,9 @@ class TemperatureDataProcessor:
     def parallel_fetch(self):
         """
         Fetches data for all temperature elements in parallel.
+
+        Returns:
+        - Dictionary containing processed data for each element.
         """
         fetch_tasks = []
         for station in self.station_triplets:
@@ -95,10 +110,17 @@ class TemperatureDataProcessor:
     def clean_temp_data(self, df, temp_range=(-50, 130)):
         """
         Cleans temperature data by removing extreme values and flagging anomalies.
+
+        Parameters:
+        - df (DataFrame): Temperature dataset.
+        - temp_range (tuple): Valid temperature range.
+
+        Returns:
+        - Cleaned DataFrame with QC flags.
         """
-        df.index = pd.to_datetime(df.index).normalize()
+        df.index = pd.to_datetime(df.index)  # Ensure timestamps are properly formatted
         
-        # Preserve original values with "_raw" instead of "_original"
+        # Preserve original values and set default QC flags
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
             if col in df.columns:
                 df[f"{col}_raw"] = df[col]
@@ -109,23 +131,30 @@ class TemperatureDataProcessor:
             if col in df.columns:
                 outliers = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
                 df.loc[outliers, f"{col}_qc_flag"] = "E"
-                df.loc[outliers, col] = np.nan  
+                df.loc[outliers, col] = np.nan  # Replace with NaN
 
         return df
 
     def export_to_csv(self, df, filename="temperature_cleaned.csv"):
         """
         Exports cleaned data to a CSV file.
+
+        Parameters:
+        - df (DataFrame): Cleaned temperature data.
+        - filename (str): CSV filename.
         """
         df.to_csv(filename, index=True)
         print(f"Cleaned data saved to {filename}")
 
-    def plot_raw_data(self, df, title="Raw Temperature Data"):
+    def plot_raw_data(self, df):
         """
-        Plots the raw temperature data.
+        Plots raw temperature data.
+
+        Parameters:
+        - df (DataFrame): Temperature dataset.
         """
         if df is None or df.empty:
-            print(f"Warning: {title} has no data to plot.")
+            print("Warning: No data to plot.")
             return
 
         fig = go.Figure()
@@ -133,13 +162,13 @@ class TemperatureDataProcessor:
             if col in df.columns:
                 fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col))
 
-        fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Temperature (°F)")
+        fig.update_layout(title="Raw Temperature Data", xaxis_title="Date", yaxis_title="Temperature (°F)")
         fig.show()
 
 # ---------------------- SCRIPT EXECUTION ----------------------
 station_triplets = ["737:CO:SNTL"]
-start_date = "2024-01-01"
-end_date = "2024-12-31"
+start_date = "2024-01-01 00:00"
+end_date = "2024-12-31 23:59"
 
 # Initialize processor
 temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date)
@@ -147,8 +176,14 @@ temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date
 print("\n--- Fetching Data ---\n")
 temp_data = temp_processor.parallel_fetch()
 
-# Merge datasets properly
-df_combined = pd.concat(temp_data.values(), axis=1).sort_index()
+# Merge datasets
+df_combined = None
+for key, df in temp_data.items():
+    if not df.empty:
+        if df_combined is None:
+            df_combined = df
+        else:
+            df_combined = df_combined.join(df, how="outer")
 
 # Clean data
 df_cleaned = temp_processor.clean_temp_data(df_combined)
