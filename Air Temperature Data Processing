@@ -51,13 +51,12 @@ class TemperatureDataProcessor:
             "centralTendencyType": "NONE"
         }
         response = requests.get(self.base_url, params=params)
-
+        
         print(f"\nFetching {element} for {station_triplet} - Status Code: {response.status_code}")
         print(f"API Request URL: {response.url}")
 
         if response.status_code == 200:
-            data = response.json()
-            return data
+            return response.json()
         else:
             print(f"Error fetching {element} data for {station_triplet}: {response.status_code}")
             return None
@@ -74,11 +73,13 @@ class TemperatureDataProcessor:
         - Pandas DataFrame containing processed data.
         """
         if not data_json or not isinstance(data_json, list):
+            print(f"Error: No data found for {label}")
             return pd.DataFrame()
 
         try:
             flat_data = [val for sublist in data_json[0].get('data', []) for val in sublist.get('values', [])]
             if not flat_data:
+                print(f"Warning: {label} returned empty data.")
                 return pd.DataFrame()
             
             df = pd.DataFrame(flat_data)
@@ -87,7 +88,8 @@ class TemperatureDataProcessor:
             df['value'] = df['value'].astype(float)
             df.rename(columns={'value': label}, inplace=True)
             return df
-        except Exception:
+        except Exception as e:
+            print(f"Error processing {label}: {e}")
             return pd.DataFrame()
 
     def parallel_fetch(self):
@@ -124,11 +126,11 @@ class TemperatureDataProcessor:
         - Cleaned DataFrame with QC flags.
         """
         df.index = pd.to_datetime(df.index).normalize()
-
-        # Preserve original values and set default QC flags
+        
+        # Preserve original values as "_raw" and set default QC flags
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
             if col in df.columns:
-                df[f"{col}_raw"] = df[col]  # Change from _original to _raw
+                df[f"{col}_raw"] = df[col]
                 df[f"{col}_qc_flag"] = "V"  # Default flag is valid
 
         # Flag and remove extreme temperature values
@@ -136,20 +138,29 @@ class TemperatureDataProcessor:
             if col in df.columns:
                 outliers = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
                 df.loc[outliers, f"{col}_qc_flag"] = "E"
-                df.loc[outliers, col] = ""  # Replace with empty string instead of NaN
+                df.loc[outliers, col] = np.nan  # Replace with NaN (will be empty in CSV)
 
         return df
 
-    def export_to_csv(self, df, filename="temperature_cleaned.csv"):
+    def plot_data(self, df, title="Temperature Observations"):
         """
-        Exports cleaned data to a CSV file.
+        Plots the temperature data.
 
         Parameters:
-        - df (DataFrame): Cleaned temperature data.
-        - filename (str): CSV filename.
+        - df (DataFrame): Data to plot.
+        - title (str): Title of the plot.
         """
-        df.to_csv(filename, index=True)
-        print(f"Cleaned data saved to {filename}")
+        if df is None or df.empty:
+            print(f"Warning: {title} has no data to plot.")
+            return
+
+        fig = go.Figure()
+        for col in ["TOBS", "TMAX", "TMIN", "TAVG"]:
+            if col in df.columns:
+                fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=f"{col} (°F)"))
+
+        fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Temperature (°F)")
+        fig.show()
 
 # ---------------------- SCRIPT EXECUTION ----------------------
 station_triplets = ["737:CO:SNTL"]
@@ -171,8 +182,18 @@ for key, df in temp_data.items():
         else:
             df_combined = df_combined.join(df, how="outer")
 
-# Clean data
+# **PLOT RAW DATA BEFORE CLEANING**
+if df_combined is not None and not df_combined.empty:
+    print("\n--- Plotting Unedited Raw Data ---\n")
+    temp_processor.plot_data(df_combined, title="Raw Temperature Data (Unedited)")
+
+# Clean Data
+print("\n--- Cleaning Data ---\n")
 df_cleaned = temp_processor.clean_temp_data(df_combined)
+
+# **PLOT CLEANED DATA**
+print("\n--- Plotting Cleaned Data ---\n")
+temp_processor.plot_data(df_cleaned, title="Cleaned Temperature Data")
 
 # Export to CSV
 columns_to_export = [
