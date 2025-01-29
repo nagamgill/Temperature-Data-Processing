@@ -4,7 +4,6 @@ import requests
 import dask
 from dask.diagnostics import ProgressBar
 import plotly.graph_objects as go
-import sqlite3
 
 class TemperatureDataProcessor:
     """
@@ -12,23 +11,21 @@ class TemperatureDataProcessor:
     from USDA NRCS AWDB API.
     """
 
-    def __init__(self, station_triplets, start_date, end_date, db_name="temperature_data.db"):
+    def __init__(self, station_triplets, start_date, end_date):
         """
         Initializes the TemperatureDataProcessor.
 
         Parameters:
         - station_triplets (list): List of station identifiers.
-        - start_date (str): Start date in YYYY-MM-DD HH:mm format.
-        - end_date (str): End date in YYYY-MM-DD HH:mm format.
-        - db_name (str): SQLite database name for data storage.
+        - start_date (str): Start date in 'YYYY-MM-DD HH:mm' format.
+        - end_date (str): End date in 'YYYY-MM-DD HH:mm' format.
         """
         self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
         self.station_triplets = station_triplets
-        self.start_date = pd.to_datetime(start_date).strftime("%Y-%m-%d %H:%M")  # Ensure correct format
-        self.end_date = pd.to_datetime(end_date).strftime("%Y-%m-%d %H:%M")  # Ensure correct format
-        self.db_name = db_name
-        self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]
+        self.start_date = start_date
+        self.end_date = end_date
+        self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]  # Elements to fetch
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # Corresponding durations
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """
@@ -77,7 +74,7 @@ class TemperatureDataProcessor:
                 return pd.DataFrame()
             
             df = pd.DataFrame(flat_data)
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')  # Ensure correct datetime format
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
             df.rename(columns={'value': label}, inplace=True)
@@ -118,13 +115,13 @@ class TemperatureDataProcessor:
         Returns:
         - Cleaned DataFrame with QC flags.
         """
-        df.index = pd.to_datetime(df.index)  # Ensure timestamps are properly formatted
+        df.index = pd.to_datetime(df.index).normalize()
         
         # Preserve original values and set default QC flags
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
             if col in df.columns:
                 df[f"{col}_raw"] = df[col]
-                df[f"{col}_qc_flag"] = "V"
+                df[f"{col}_qc_flag"] = "V"  # Default flag is valid
 
         # Flag and remove extreme temperature values
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
@@ -135,23 +132,12 @@ class TemperatureDataProcessor:
 
         return df
 
-    def export_to_csv(self, df, filename="temperature_cleaned.csv"):
-        """
-        Exports cleaned data to a CSV file.
-
-        Parameters:
-        - df (DataFrame): Cleaned temperature data.
-        - filename (str): CSV filename.
-        """
-        df.to_csv(filename, index=True)
-        print(f"Cleaned data saved to {filename}")
-
     def plot_raw_data(self, df):
         """
-        Plots raw temperature data.
+        Plots raw temperature data before cleaning.
 
         Parameters:
-        - df (DataFrame): Temperature dataset.
+        - df (DataFrame): Raw temperature data.
         """
         if df is None or df.empty:
             print("Warning: No data to plot.")
@@ -184,6 +170,10 @@ for key, df in temp_data.items():
             df_combined = df
         else:
             df_combined = df_combined.join(df, how="outer")
+
+# Ensure index uniqueness before sorting
+df_combined = df_combined[~df_combined.index.duplicated(keep="first")]
+df_combined = df_combined.sort_index()
 
 # Clean data
 df_cleaned = temp_processor.clean_temp_data(df_combined)
