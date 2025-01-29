@@ -28,7 +28,7 @@ class TemperatureDataProcessor:
         self.end_date = end_date
         self.db_name = db_name
         self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]  # Elements to fetch
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # Corresponding durations for elements
+        self.durations = ["DAILY", "DAILY", "DAILY", "DAILY"]  # Ensures correct duration mapping
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """
@@ -51,10 +51,15 @@ class TemperatureDataProcessor:
             "centralTendencyType": "NONE"
         }
         response = requests.get(self.base_url, params=params)
+
+        print(f"\nFetching {element} for {station_triplet} - Status Code: {response.status_code}")
+        print(f"API Request URL: {response.url}")
+
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            return data
         else:
-            print(f"Error fetching {element} data: {response.status_code}")
+            print(f"Error fetching {element} data for {station_triplet}: {response.status_code}")
             return None
 
     def preprocess_data(self, data_json, label):
@@ -119,11 +124,11 @@ class TemperatureDataProcessor:
         - Cleaned DataFrame with QC flags.
         """
         df.index = pd.to_datetime(df.index).normalize()
-        
+
         # Preserve original values and set default QC flags
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
             if col in df.columns:
-                df[f"{col}_original"] = df[col]
+                df[f"{col}_raw"] = df[col]  # Change from _original to _raw
                 df[f"{col}_qc_flag"] = "V"  # Default flag is valid
 
         # Flag and remove extreme temperature values
@@ -171,10 +176,10 @@ df_cleaned = temp_processor.clean_temp_data(df_combined)
 
 # Export to CSV
 columns_to_export = [
-    "TMAX_original", "TMAX", "TMAX_qc_flag",
-    "TMIN_original", "TMIN", "TMIN_qc_flag",
-    "TAVG_original", "TAVG", "TAVG_qc_flag",
-    "TOBS_original", "TOBS", "TOBS_qc_flag",
+    "TMAX_raw", "TMAX", "TMAX_qc_flag",
+    "TMIN_raw", "TMIN", "TMIN_qc_flag",
+    "TAVG_raw", "TAVG", "TAVG_qc_flag",
+    "TOBS_raw", "TOBS", "TOBS_qc_flag",
 ]
 df_cleaned[columns_to_export].to_csv("temperature_cleaned.csv", index=True)
 print("Cleaned data saved to 'temperature_cleaned.csv'.")
