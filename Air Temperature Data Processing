@@ -11,23 +11,21 @@ class TemperatureDataProcessor:
     from USDA NRCS AWDB API.
     """
 
-    def __init__(self, station_triplets, start_date, end_date, db_name="temperature_data.db"):
+    def __init__(self, station_triplets, start_date, end_date):
         """
         Initializes the TemperatureDataProcessor.
 
         Parameters:
         - station_triplets (list): List of station identifiers.
-        - start_date (str): Start date in YYYY-MM-DD format.
-        - end_date (str): End date in YYYY-MM-DD format.
-        - db_name (str): SQLite database name for data storage.
+        - start_date (str): Start date in 'YYYY-MM-DD HH:mm' format.
+        - end_date (str): End date in 'YYYY-MM-DD HH:mm' format.
         """
         self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
         self.station_triplets = station_triplets
         self.start_date = start_date
         self.end_date = end_date
-        self.db_name = db_name
         self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]  # Elements to fetch
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # Corresponding durations for elements
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # TOBS is hourly, others are daily
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """
@@ -56,17 +54,17 @@ class TemperatureDataProcessor:
             print(f"Error fetching {element} data: {response.status_code}")
             return None
 
-    def preprocess_data(self, data_json, label, is_hourly=False):
+    def preprocess_data(self, data_json, label, duration):
         """
-        Converts API JSON response to a pandas DataFrame and aligns timestamps.
+        Converts API JSON response to a pandas DataFrame.
 
         Parameters:
         - data_json (dict): JSON response from API.
         - label (str): Column name for temperature element.
-        - is_hourly (bool): If True, data is hourly and must be aggregated.
+        - duration (str): Either "DAILY" or "HOURLY".
 
         Returns:
-        - Pandas DataFrame with corrected timestamps.
+        - Pandas DataFrame containing processed data.
         """
         if not data_json or not isinstance(data_json, list):
             return pd.DataFrame()
@@ -75,18 +73,18 @@ class TemperatureDataProcessor:
             flat_data = [val for sublist in data_json[0].get('data', []) for val in sublist.get('values', [])]
             if not flat_data:
                 return pd.DataFrame()
-            
+
             df = pd.DataFrame(flat_data)
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')  # Convert timestamps
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+            # If data is HOURLY, normalize to daily timestamps
+            if duration == "HOURLY":
+                df['date'] = df['date'].dt.date  # Convert to daily resolution
+
+            df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
             df.rename(columns={'value': label}, inplace=True)
 
-            # If hourly data (TOBS), aggregate to daily
-            if is_hourly:
-                df['date'] = df['date'].dt.date  # Convert to YYYY-MM-DD
-                df = df.groupby('date').mean()  # Aggregate hourly to daily
-
-            df.set_index('date', inplace=True)
             return df
         except Exception:
             return pd.DataFrame()
@@ -107,10 +105,9 @@ class TemperatureDataProcessor:
             results = dask.compute(*fetch_tasks, num_workers=4)
 
         processed_data = {}
-        for (element, result) in zip(self.elements, results):
+        for (element, result, duration) in zip(self.elements, results, self.durations):
             label = element.split(":")[0]
-            is_hourly = (label == "TOBS")  # Mark TOBS as hourly
-            processed_data[label] = self.preprocess_data(result, label, is_hourly=is_hourly)
+            processed_data[label] = self.preprocess_data(result, label, duration)
 
         return processed_data
 
@@ -127,41 +124,30 @@ class TemperatureDataProcessor:
         """
         df.index = pd.to_datetime(df.index).normalize()
 
-        # Preserve original values and set default QC flags
-        for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
+        valid_columns = ["TMAX", "TMIN", "TAVG", "TOBS"]
+        for col in valid_columns:
             if col in df.columns:
-                df[f"{col}_raw"] = df[col]
-                df[f"{col}_qc_flag"] = "V"
+                df[f"{col}_raw"] = df[col]  # Keep original values
+                df[f"{col}_qc_flag"] = "V"  # Default is valid
 
-        # Flag and remove extreme temperature values
-        for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
+        for col in valid_columns:
             if col in df.columns:
                 outliers = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
                 df.loc[outliers, f"{col}_qc_flag"] = "E"
-                df.loc[outliers, col] = np.nan  # Replace with NaN
+                df.loc[outliers, col] = np.nan  # Replace outliers with NaN
 
         return df
 
-    def export_to_csv(self, df, filename="temperature_cleaned.csv"):
+    def plot_data(self, df, title):
         """
-        Exports cleaned data to a CSV file.
+        Plots temperature data.
 
         Parameters:
-        - df (DataFrame): Cleaned temperature data.
-        - filename (str): CSV filename.
-        """
-        df.to_csv(filename, index=True)
-        print(f"Cleaned data saved to {filename}")
-
-    def plot_raw_data(self, df):
-        """
-        Plots raw temperature data.
-
-        Parameters:
-        - df (DataFrame): Data to plot.
+        - df (DataFrame): Temperature data.
+        - title (str): Title for the plot.
         """
         if df is None or df.empty:
-            print("No data to plot.")
+            print(f"Warning: No data to plot for {title}.")
             return
 
         fig = go.Figure()
@@ -169,13 +155,13 @@ class TemperatureDataProcessor:
             if col in df.columns:
                 fig.add_trace(go.Scatter(x=df.index, y=df[col], mode="lines", name=col))
 
-        fig.update_layout(title="Raw Temperature Data", xaxis_title="Date", yaxis_title="Temperature (°F)")
+        fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Temperature (°F)")
         fig.show()
 
 # ---------------------- SCRIPT EXECUTION ----------------------
 station_triplets = ["737:CO:SNTL"]
-start_date = "2024-01-01"
-end_date = "2024-12-31"
+start_date = "2024-01-01 00:00"
+end_date = "2024-12-31 23:59"
 
 # Initialize processor
 temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date)
@@ -183,26 +169,29 @@ temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date
 print("\n--- Fetching Data ---\n")
 temp_data = temp_processor.parallel_fetch()
 
-# Merge datasets using daily timestamps
+# Merge datasets
 df_combined = None
 for key, df in temp_data.items():
     if not df.empty:
-        df.index = pd.to_datetime(df.index)  # Ensure index is in datetime format
-        df.index = df.index.normalize()  # Normalize timestamps to YYYY-MM-DD
-
         if df_combined is None:
             df_combined = df
         else:
             df_combined = df_combined.join(df, how="outer")
 
-df_combined.sort_index(inplace=True)  # Ensure correct chronological order
+# Ensure index uniqueness before sorting
+df_combined = df_combined[~df_combined.index.duplicated(keep="first")]
+df_combined = df_combined.sort_index()
+
+# Plot raw data **before cleaning**
+print("\n--- Plotting Raw Data (Before Cleaning) ---\n")
+temp_processor.plot_data(df_combined, "Raw Temperature Data (Before Cleaning)")
 
 # Clean data
 df_cleaned = temp_processor.clean_temp_data(df_combined)
 
 # Export to CSV
 columns_to_export = [
-    "AUX_raw", "TMAX", "TMAX_qc_flag",
+    "TMAX_raw", "TMAX", "TMAX_qc_flag",
     "TMIN_raw", "TMIN", "TMIN_qc_flag",
     "TAVG_raw", "TAVG", "TAVG_qc_flag",
     "TOBS_raw", "TOBS", "TOBS_qc_flag",
@@ -210,6 +199,6 @@ columns_to_export = [
 df_cleaned[columns_to_export].to_csv("temperature_cleaned.csv", index=True)
 print("Cleaned data saved to 'temperature_cleaned.csv'.")
 
-# Plot raw data
-print("\n--- Plotting Raw Data ---\n")
-temp_processor.plot_raw_data(df_combined)
+# Plot cleaned data **after cleaning**
+print("\n--- Plotting Cleaned Data (After Cleaning) ---\n")
+temp_processor.plot_data(df_cleaned, "Cleaned Temperature Data (After Cleaning)")
