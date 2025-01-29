@@ -11,21 +11,23 @@ class TemperatureDataProcessor:
     from USDA NRCS AWDB API.
     """
 
-    def __init__(self, station_triplets, start_date, end_date):
+    def __init__(self, station_triplets, start_date, end_date, db_name="temperature_data.db"):
         """
         Initializes the TemperatureDataProcessor.
 
         Parameters:
         - station_triplets (list): List of station identifiers.
-        - start_date (str): Start date in 'YYYY-MM-DD HH:mm' format.
-        - end_date (str): End date in 'YYYY-MM-DD HH:mm' format.
+        - start_date (str): Start date in YYYY-MM-DD format.
+        - end_date (str): End date in YYYY-MM-DD format.
+        - db_name (str): SQLite database name for data storage.
         """
         self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
         self.station_triplets = station_triplets
         self.start_date = start_date
         self.end_date = end_date
+        self.db_name = db_name
         self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]  # Elements to fetch
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # Corresponding durations
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # Corresponding durations for elements
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """
@@ -54,16 +56,17 @@ class TemperatureDataProcessor:
             print(f"Error fetching {element} data: {response.status_code}")
             return None
 
-    def preprocess_data(self, data_json, label):
+    def preprocess_data(self, data_json, label, is_hourly=False):
         """
-        Converts API JSON response to a pandas DataFrame.
+        Converts API JSON response to a pandas DataFrame and aligns timestamps.
 
         Parameters:
         - data_json (dict): JSON response from API.
         - label (str): Column name for temperature element.
+        - is_hourly (bool): If True, data is hourly and must be aggregated.
 
         Returns:
-        - Pandas DataFrame containing processed data.
+        - Pandas DataFrame with corrected timestamps.
         """
         if not data_json or not isinstance(data_json, list):
             return pd.DataFrame()
@@ -74,10 +77,16 @@ class TemperatureDataProcessor:
                 return pd.DataFrame()
             
             df = pd.DataFrame(flat_data)
-            df['date'] = pd.to_datetime(df['date'], errors='coerce')
-            df.set_index('date', inplace=True)
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')  # Convert timestamps
             df['value'] = df['value'].astype(float)
             df.rename(columns={'value': label}, inplace=True)
+
+            # If hourly data (TOBS), aggregate to daily
+            if is_hourly:
+                df['date'] = df['date'].dt.date  # Convert to YYYY-MM-DD
+                df = df.groupby('date').mean()  # Aggregate hourly to daily
+
+            df.set_index('date', inplace=True)
             return df
         except Exception:
             return pd.DataFrame()
@@ -100,7 +109,8 @@ class TemperatureDataProcessor:
         processed_data = {}
         for (element, result) in zip(self.elements, results):
             label = element.split(":")[0]
-            processed_data[label] = self.preprocess_data(result, label)
+            is_hourly = (label == "TOBS")  # Mark TOBS as hourly
+            processed_data[label] = self.preprocess_data(result, label, is_hourly=is_hourly)
 
         return processed_data
 
@@ -116,12 +126,12 @@ class TemperatureDataProcessor:
         - Cleaned DataFrame with QC flags.
         """
         df.index = pd.to_datetime(df.index).normalize()
-        
+
         # Preserve original values and set default QC flags
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
             if col in df.columns:
                 df[f"{col}_raw"] = df[col]
-                df[f"{col}_qc_flag"] = "V"  # Default flag is valid
+                df[f"{col}_qc_flag"] = "V"
 
         # Flag and remove extreme temperature values
         for col in ["TMAX", "TMIN", "TAVG", "TOBS"]:
@@ -132,15 +142,26 @@ class TemperatureDataProcessor:
 
         return df
 
-    def plot_raw_data(self, df):
+    def export_to_csv(self, df, filename="temperature_cleaned.csv"):
         """
-        Plots raw temperature data before cleaning.
+        Exports cleaned data to a CSV file.
 
         Parameters:
-        - df (DataFrame): Raw temperature data.
+        - df (DataFrame): Cleaned temperature data.
+        - filename (str): CSV filename.
+        """
+        df.to_csv(filename, index=True)
+        print(f"Cleaned data saved to {filename}")
+
+    def plot_raw_data(self, df):
+        """
+        Plots raw temperature data.
+
+        Parameters:
+        - df (DataFrame): Data to plot.
         """
         if df is None or df.empty:
-            print("Warning: No data to plot.")
+            print("No data to plot.")
             return
 
         fig = go.Figure()
@@ -153,8 +174,8 @@ class TemperatureDataProcessor:
 
 # ---------------------- SCRIPT EXECUTION ----------------------
 station_triplets = ["737:CO:SNTL"]
-start_date = "2024-01-01 00:00"
-end_date = "2024-12-31 23:59"
+start_date = "2024-01-01"
+end_date = "2024-12-31"
 
 # Initialize processor
 temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date)
@@ -162,25 +183,26 @@ temp_processor = TemperatureDataProcessor(station_triplets, start_date, end_date
 print("\n--- Fetching Data ---\n")
 temp_data = temp_processor.parallel_fetch()
 
-# Merge datasets
+# Merge datasets using daily timestamps
 df_combined = None
 for key, df in temp_data.items():
     if not df.empty:
+        df.index = pd.to_datetime(df.index)  # Ensure index is in datetime format
+        df.index = df.index.normalize()  # Normalize timestamps to YYYY-MM-DD
+
         if df_combined is None:
             df_combined = df
         else:
             df_combined = df_combined.join(df, how="outer")
 
-# Ensure index uniqueness before sorting
-df_combined = df_combined[~df_combined.index.duplicated(keep="first")]
-df_combined = df_combined.sort_index()
+df_combined.sort_index(inplace=True)  # Ensure correct chronological order
 
 # Clean data
 df_cleaned = temp_processor.clean_temp_data(df_combined)
 
 # Export to CSV
 columns_to_export = [
-    "TMAX_raw", "TMAX", "TMAX_qc_flag",
+    "AUX_raw", "TMAX", "TMAX_qc_flag",
     "TMIN_raw", "TMIN", "TMIN_qc_flag",
     "TAVG_raw", "TAVG", "TAVG_qc_flag",
     "TOBS_raw", "TOBS", "TOBS_qc_flag",
