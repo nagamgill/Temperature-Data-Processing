@@ -50,11 +50,11 @@ class TemperatureDataProcessor:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
             if duration == "HOURLY":
-                df['date'] = df['date']  # Keep precise timestamps
+                df.set_index('date', inplace=True)
             else:
-                df['date'] = df['date'].dt.date  # Normalize daily data
+                df['date'] = df['date'].dt.normalize()  # Convert to daily timestamps
+                df.set_index('date', inplace=True)
 
-            df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
             element_label = element.split(":")[0]
             df.rename(columns={'value': f"{station_id}_{element_label}"}, inplace=True)
@@ -81,6 +81,7 @@ class TemperatureDataProcessor:
                 dfs.append(df)
 
         combined_df = pd.concat(dfs, axis=1).sort_index()
+        combined_df.index = pd.to_datetime(combined_df.index)  # Ensure all indexes are timestamps
         combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first')]  # Drop duplicates
         return combined_df
 
