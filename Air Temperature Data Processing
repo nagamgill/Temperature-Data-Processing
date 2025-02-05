@@ -17,7 +17,7 @@ class TemperatureDataProcessor:
         self.start_date = start_date
         self.end_date = end_date
         self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # TOBS is HOURLY, others are DAILY
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """Fetch data for a single station and element."""
@@ -38,7 +38,7 @@ class TemperatureDataProcessor:
             return None
 
     def preprocess_data(self, data_json, station_id, element, duration):
-        """Process data and ensure timestamps align properly."""
+        """Process data and prefix columns with station ID."""
         if not data_json or not isinstance(data_json, list):
             return pd.DataFrame()
 
@@ -48,9 +48,9 @@ class TemperatureDataProcessor:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
             if duration == "HOURLY":
-                df['date'] = df['date']  # Keep TOBS as hourly
+                df['date'] = df['date'].dt.floor("H")  # Keep full hourly timestamps
             else:
-                df['date'] = df['date'].dt.floor("D")  # Convert daily timestamps to midnight
+                df['date'] = df['date'].dt.date  # Normalize daily to a single date
 
             df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
@@ -70,16 +70,14 @@ class TemperatureDataProcessor:
         with ProgressBar():
             results = dask.compute(*tasks, num_workers=4)
 
-        # Map results to stations and elements
         dfs = []
         for idx, (station, (element, duration)) in enumerate(product(self.station_triplets, zip(self.elements, self.durations))):
             result = results[idx]
-            element_label = element.split(":")[0]
             df = self.preprocess_data(result, station, element, duration)
             if not df.empty:
                 dfs.append(df)
 
-        # Outer join all DataFrames on date
+        # Merge all DataFrames on date
         combined_df = pd.concat(dfs, axis=1).sort_index()
         combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first')]
         return combined_df
@@ -89,9 +87,9 @@ class TemperatureDataProcessor:
         df.index = pd.to_datetime(df.index)
 
         # Resample TOBS to daily statistics
-        tobs_max = df.filter(like="TOBS").resample("D").max()
-        tobs_min = df.filter(like="TOBS").resample("D").min()
-        tobs_mean = df.filter(like="TOBS").resample("D").mean()
+        tobs_max = df.filter(like="TOBS").resample("D").max().reindex(df.index)
+        tobs_min = df.filter(like="TOBS").resample("D").min().reindex(df.index)
+        tobs_mean = df.filter(like="TOBS").resample("D").mean().reindex(df.index)
 
         # Drop NaN values in TOBS before comparison
         tobs_max.dropna(inplace=True)
@@ -115,7 +113,7 @@ class TemperatureDataProcessor:
                 df.loc[threshold_violations, qc_col] = "E"
                 df.loc[threshold_violations, col] = np.nan
 
-                # Ensure TOBS data is aligned with the daily timestamps before comparison
+                # Ensure TOBS data is aligned with daily timestamps before comparison
                 if element == "TMAX":
                     if station_id + "_TOBS" in tobs_max.columns:
                         invalid = df[col] > (tobs_max[station_id + "_TOBS"] + 5)
@@ -137,7 +135,7 @@ class TemperatureDataProcessor:
         return df
 
     def plot_comparison(self, raw_df, cleaned_df, title):
-        """Plot comparison of raw vs. cleaned temperature data."""
+        """Plot comparison for all stations/elements."""
         fig = go.Figure()
         for col in cleaned_df.columns:
             if "_qc_flag" not in col and "_raw" not in col:
