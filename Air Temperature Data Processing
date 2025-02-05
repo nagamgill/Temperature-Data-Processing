@@ -16,10 +16,8 @@ class TemperatureDataProcessor:
         self.station_triplets = station_triplets
         self.start_date = start_date
         self.end_date = end_date
-
-        # TOBS is fetched hourly, others are daily
         self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]
-        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # TOBS is HOURLY, others are DAILY
 
     def fetch_awdb_data(self, station_triplet, element, duration):
         """Fetch data for a single station and element."""
@@ -40,7 +38,7 @@ class TemperatureDataProcessor:
             return None
 
     def preprocess_data(self, data_json, station_id, element, duration):
-        """Convert API response into a pandas DataFrame."""
+        """Process data and ensure timestamps align properly."""
         if not data_json or not isinstance(data_json, list):
             return pd.DataFrame()
 
@@ -50,11 +48,11 @@ class TemperatureDataProcessor:
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
 
             if duration == "HOURLY":
-                df.set_index('date', inplace=True)
+                df['date'] = df['date']  # Keep TOBS as hourly
             else:
-                df['date'] = df['date'].dt.normalize()  # Convert to daily timestamps
-                df.set_index('date', inplace=True)
+                df['date'] = df['date'].dt.floor("D")  # Convert daily timestamps to midnight
 
+            df.set_index('date', inplace=True)
             df['value'] = df['value'].astype(float)
             element_label = element.split(":")[0]
             df.rename(columns={'value': f"{station_id}_{element_label}"}, inplace=True)
@@ -72,6 +70,7 @@ class TemperatureDataProcessor:
         with ProgressBar():
             results = dask.compute(*tasks, num_workers=4)
 
+        # Map results to stations and elements
         dfs = []
         for idx, (station, (element, duration)) in enumerate(product(self.station_triplets, zip(self.elements, self.durations))):
             result = results[idx]
@@ -80,19 +79,24 @@ class TemperatureDataProcessor:
             if not df.empty:
                 dfs.append(df)
 
+        # Outer join all DataFrames on date
         combined_df = pd.concat(dfs, axis=1).sort_index()
-        combined_df.index = pd.to_datetime(combined_df.index)  # Ensure all indexes are timestamps
-        combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first')]  # Drop duplicates
+        combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first')]
         return combined_df
 
     def clean_temp_data(self, df, temp_range=(-50, 130)):
-        """Apply TOBS-based validation while keeping the original thresholds."""
+        """Apply TOBS-based validation while keeping original thresholds."""
         df.index = pd.to_datetime(df.index)
 
-        # Compute TOBS daily summary values
+        # Resample TOBS to daily statistics
         tobs_max = df.filter(like="TOBS").resample("D").max()
         tobs_min = df.filter(like="TOBS").resample("D").min()
         tobs_mean = df.filter(like="TOBS").resample("D").mean()
+
+        # Drop NaN values in TOBS before comparison
+        tobs_max.dropna(inplace=True)
+        tobs_min.dropna(inplace=True)
+        tobs_mean.dropna(inplace=True)
 
         for col in df.columns:
             if "_raw" not in col and "_qc_flag" not in col:
@@ -109,25 +113,31 @@ class TemperatureDataProcessor:
                 # Apply original thresholds
                 threshold_violations = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
                 df.loc[threshold_violations, qc_col] = "E"
-                df.loc[threshold_violations, col] = ""
+                df.loc[threshold_violations, col] = np.nan
 
-                # Apply TOBS-based validation
-                if "TMAX" in col:
-                    invalid = df[col] > (tobs_max[station_id + "_TOBS"] + 5)
-                elif "TMIN" in col:
-                    invalid = df[col] < (tobs_min[station_id + "_TOBS"] - 5)
-                elif "TAVG" in col:
-                    invalid = abs(df[col] - tobs_mean[station_id + "_TOBS"]) > 5
-                else:
-                    continue
+                # Ensure TOBS data is aligned with the daily timestamps before comparison
+                if element == "TMAX":
+                    if station_id + "_TOBS" in tobs_max.columns:
+                        invalid = df[col] > (tobs_max[station_id + "_TOBS"] + 5)
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
 
-                df.loc[invalid, qc_col] = "S"
-                df.loc[invalid, col] = ""
+                elif element == "TMIN":
+                    if station_id + "_TOBS" in tobs_min.columns:
+                        invalid = df[col] < (tobs_min[station_id + "_TOBS"] - 5)
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
+
+                elif element == "TAVG":
+                    if station_id + "_TOBS" in tobs_mean.columns:
+                        invalid = abs(df[col] - tobs_mean[station_id + "_TOBS"]) > 5
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
 
         return df
 
     def plot_comparison(self, raw_df, cleaned_df, title):
-        """Plot before and after data validation."""
+        """Plot comparison of raw vs. cleaned temperature data."""
         fig = go.Figure()
         for col in cleaned_df.columns:
             if "_qc_flag" not in col and "_raw" not in col:
@@ -136,14 +146,21 @@ class TemperatureDataProcessor:
                 element = station_element[-1]
                 raw_col = f"{station_id}_{element}_raw"
 
-                fig.add_trace(go.Scatter(x=raw_df.index, y=raw_df[raw_col], mode="lines", name=f"{station_id} Raw {element}", line=dict(color='lightgray')))
-                fig.add_trace(go.Scatter(x=cleaned_df.index, y=cleaned_df[col], mode="lines", name=f"{station_id} Cleaned {element}"))
-
+                # Plot raw and cleaned data
+                fig.add_trace(go.Scatter(
+                    x=raw_df.index, y=raw_df[raw_col],
+                    mode="lines", name=f"{station_id} Raw {element}",
+                    line=dict(color='lightgray')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=cleaned_df.index, y=cleaned_df[col],
+                    mode="lines", name=f"{station_id} Cleaned {element}"
+                ))
         fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Temperature (°F)")
         fig.show()
 
 # ---------------------- EXECUTION ----------------------
-stations = ["840:CO:SNTL"]
+stations = ["713:CO:SNTL"]  # Example station
 start_date = "1970-01-01 00:00"
 end_date = "2025-01-29 00:00"
 
@@ -152,5 +169,6 @@ raw_data = processor.parallel_fetch()
 cleaned_data = processor.clean_temp_data(raw_data)
 processor.plot_comparison(raw_data, cleaned_data, "Temperature Data Validation")
 
+# Save cleaned data
 cleaned_data.to_csv("temperature_cleaned.csv")
 print("Cleaned data saved to 'temperature_cleaned.csv'.")
