@@ -1,0 +1,187 @@
+import pandas as pd
+import numpy as np
+import requests
+import dask
+from dask.diagnostics import ProgressBar
+import plotly.graph_objects as go
+from itertools import product
+
+class TemperatureDataProcessor:
+    """
+    A class for fetching, processing, and editing temperature data for multiple stations.
+    """
+
+    def __init__(self, station_triplets, start_date, end_date):
+        self.base_url = "https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data"
+        self.station_triplets = station_triplets
+        self.start_date = start_date
+        self.end_date = end_date
+        self.elements = ["TOBS:*:1", "TMAX:*:1", "TMIN:*:1", "TAVG:*:1"]
+        self.durations = ["HOURLY", "DAILY", "DAILY", "DAILY"]  # TOBS is HOURLY, others DAILY
+
+    def fetch_awdb_data(self, station_triplet, element, duration):
+        """Fetch data for a single station and element."""
+        try:
+            params = {
+                "stationTriplets": station_triplet,
+                "beginDate": self.start_date,
+                "endDate": self.end_date,
+                "duration": duration,
+                "elements": element,
+                "centralTendencyType": "NONE"
+            }
+            response = requests.get(self.base_url, params=params, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching {element} for {station_triplet}: {e}")
+            return None
+
+    def preprocess_data(self, data_json, station_id, element, duration):
+        """Process data and prefix columns with station ID."""
+        if not data_json or not isinstance(data_json, list):
+            return pd.DataFrame()
+
+        try:
+            flat_data = [val for sublist in data_json[0].get('data', []) for val in sublist.get('values', [])]
+            df = pd.DataFrame(flat_data)
+            df['date'] = pd.to_datetime(df['date'], errors='coerce')
+
+            if duration == "HOURLY":
+                df['date'] = df['date'].dt.floor("H")  # Keep full hourly timestamps
+            else:
+                df['date'] = df['date'].dt.date  # Normalize daily to a single date
+
+            df.set_index('date', inplace=True)
+            df['value'] = df['value'].astype(float)
+            element_label = element.split(":")[0]
+            df.rename(columns={'value': f"{station_id}_{element_label}"}, inplace=True)
+            return df
+        except Exception as e:
+            print(f"Error preprocessing {station_id}_{element}: {e}")
+            return pd.DataFrame()
+
+    def parallel_fetch(self):
+        """Fetch and process data for all stations/elements in parallel."""
+        tasks = []
+        for station, (element, duration) in product(self.station_triplets, zip(self.elements, self.durations)):
+            tasks.append(dask.delayed(self.fetch_awdb_data)(station, element, duration))
+
+        with ProgressBar():
+            results = dask.compute(*tasks, num_workers=4)
+
+        dfs = []
+        for idx, (station, (element, duration)) in enumerate(product(self.station_triplets, zip(self.elements, self.durations))):
+            result = results[idx]
+            df = self.preprocess_data(result, station, element, duration)
+            if not df.empty:
+                dfs.append(df)
+
+        # Merge all DataFrames on date
+        combined_df = pd.concat(dfs, axis=1).sort_index()
+        combined_df = combined_df.loc[~combined_df.index.duplicated(keep='first')]
+        return combined_df
+
+    def clean_temp_data(self, df, temp_range=(-50, 130)):
+        """Apply TOBS-based validation while keeping original thresholds."""
+        df.index = pd.to_datetime(df.index)
+
+        # Create daily aggregations from hourly TOBS data
+        tobs_cols = [col for col in df.columns if "TOBS" in col]
+        for tobs_col in tobs_cols:
+            # Resample hourly TOBS to daily statistics
+            station_id = tobs_col.replace("_TOBS", "")
+            df[f"{station_id}_TOBS_MAX"] = df[tobs_col].resample("D").max()
+            df[f"{station_id}_TOBS_MIN"] = df[tobs_col].resample("D").min()
+            df[f"{station_id}_TOBS_MEAN"] = df[tobs_col].resample("D").mean()
+
+        for col in df.columns:
+            if "_raw" not in col and "_qc_flag" not in col and "_TOBS_" not in col:  # Skip our new TOBS aggregation columns
+                station_element = col.split("_")
+                station_id = "_".join(station_element[:-1])
+                element = station_element[-1]
+
+                raw_col = f"{station_id}_{element}_raw"
+                qc_col = f"{station_id}_{element}_qc_flag"
+
+                df[raw_col] = df[col]
+                df[qc_col] = "V"
+
+                # Apply original thresholds
+                threshold_violations = (df[col] < temp_range[0]) | (df[col] > temp_range[1])
+                df.loc[threshold_violations, qc_col] = "E"
+                df.loc[threshold_violations, col] = np.nan
+
+                # Use the daily TOBS aggregations for comparison
+                if element == "TMAX":
+                    tobs_max_col = f"{station_id}_TOBS_MAX"
+                    if tobs_max_col in df.columns:
+                        invalid = df[col] > (df[tobs_max_col] + 5)
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
+
+                elif element == "TMIN":
+                    tobs_min_col = f"{station_id}_TOBS_MIN"
+                    if tobs_min_col in df.columns:
+                        invalid = df[col] < (df[tobs_min_col] - 5)
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
+
+                elif element == "TAVG":
+                    tobs_mean_col = f"{station_id}_TOBS_MEAN"
+                    if tobs_mean_col in df.columns:
+                        invalid = abs(df[col] - df[tobs_mean_col]) > 5
+                        df.loc[invalid, qc_col] = "S"
+                        df.loc[invalid, col] = np.nan
+
+        return df
+
+    def plot_comparison(self, raw_df, cleaned_df, title):
+        """Plot comparison for all stations/elements."""
+        fig = go.Figure()
+        for col in cleaned_df.columns:
+            if "_qc_flag" not in col and "_raw" not in col and "_TOBS_" not in col:  # Skip TOBS aggregation columns
+                station_element = col.split("_")
+                station_id = "_".join(station_element[:-1])
+                element = station_element[-1]
+                raw_col = f"{station_id}_{element}_raw"
+
+                # Plot raw and cleaned data
+                fig.add_trace(go.Scatter(
+                    x=raw_df.index, y=raw_df[raw_col],
+                    mode="lines", name=f"{station_id} Raw {element}",
+                    line=dict(color='lightgray')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=cleaned_df.index, y=cleaned_df[col],
+                    mode="lines", name=f"{station_id} Cleaned {element}"
+                ))
+        
+        # Also plot TOBS data points as markers
+        tobs_cols = [col for col in cleaned_df.columns if "TOBS" in col and "_TOBS_" not in col]  # Only original TOBS columns
+        for col in tobs_cols:
+            station_id = col.replace("_TOBS", "")
+            fig.add_trace(go.Scatter(
+                x=cleaned_df.index, y=cleaned_df[col],
+                mode="markers", name=f"{station_id} TOBS (hourly)",
+                marker=dict(size=4, opacity=0.5)
+            ))
+            
+        fig.update_layout(title=title, xaxis_title="Date", yaxis_title="Temperature (°F)")
+        fig.show()
+
+# ---------------------- EXECUTION ----------------------
+stations = ["713:CO:SNTL"]  # Example station
+start_date = "1970-01-01 00:00"
+end_date = "2025-01-29 00:00"
+
+processor = TemperatureDataProcessor(stations, start_date, end_date)
+raw_data = processor.parallel_fetch()
+cleaned_data = processor.clean_temp_data(raw_data)
+processor.plot_comparison(raw_data, cleaned_data, "Temperature Data Validation")
+
+# Save cleaned data
+cleaned_data.to_csv("temperature_cleaned.csv")
+print("Cleaned data saved to 'temperature_cleaned.csv'.")
+```
+
